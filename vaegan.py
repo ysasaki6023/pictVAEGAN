@@ -307,39 +307,46 @@ class VAEGAN:
     def buildModel(self):
         # define variables
         self.x        = tf.placeholder(tf.float32, [self.nBatch, self.imageSize[0], self.imageSize[1], 1],name="inputImage")
-        self.y_real   = tf.placeholder(tf.float32, [self.nBatch, self.imageSize[0], self.imageSize[1], 1],name="realImage")
+        self.z_fake   = tf.placeholder(tf.float32, [self.nBatch, self.zdim],                              name="fakeZ"     )
+        self.y_real   = tf.placeholder(tf.float32, [self.nBatch, self.imageSize[0], self.imageSize[1], 1],name="realImage" )
+
 
         self.z_mu, self.z_lnsigma = self.buildEncoder(self.x,isTraining=self.isTraining) # lnsigma = ln(sigma)... This admits to take -inf,+inf and make the calculation easier
         # z -> [u_1,u_2,...],[s_1,s_2,...]
         rand        = tf.random_normal([self.nBatch,self.zdim]) # normal distribution
         self.z      = rand * tf.exp(self.z_lnsigma) + self.z_mu
 
-        self.y_fake = self.buildGenerator(self.z,isTraining=self.isTraining)
+        self.y_reco = self.buildGenerator(self.z     ,isTraining=self.isTraining)
+        self.y_fake = self.buildGenerator(self.z_fake,isTraining=self.isTraining,reuse=True)
 
         self.d_real  = self.buildDiscriminator(self.y_real)
+
+        self.d_reco  = self.buildDiscriminator(self.y_reco,reuse=True)
         self.d_fake  = self.buildDiscriminator(self.y_fake,reuse=True)
 
         self.z_sample = tf.placeholder(tf.float32, [self.nBatch, self.zdim],name="z_sample")
         self.y_sample = self.buildGenerator(self.z_sample,reuse=True,isTraining=False)
 
         self.d_loss_real = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.d_real,labels=tf.ones_like (self.d_real)))
+        self.d_loss_reco = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.d_reco,labels=tf.zeros_like(self.d_reco)))
         self.d_loss_fake = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.d_fake,labels=tf.zeros_like(self.d_fake)))
+        self.g_loss_reco = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.d_reco,labels=tf.ones_like (self.d_reco)))
         self.g_loss_fake = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.d_fake,labels=tf.ones_like (self.d_fake)))
 
         #self.pix_loss = - tf.reduce_mean( self.x * tf.log( tf.clip_by_value(self.y_fake,1e-20,1e+20)) + (1.-self.x) * tf.log( tf.clip_by_value(1.-self.y_fake,1e-20,1e+20))) # bbernoulli negative log likelihood. May be replaced by RMS?
-        self.pix_loss = tf.reduce_mean( tf.abs( self.x - self.y_fake ) ) # L1 loss is to make the image more clearer
+        self.pix_loss = tf.reduce_mean( tf.abs( self.x - self.y_reco ) ) # L1 loss is to make the image more clearer
 
         self.kl_loss = 0.5 * tf.reduce_mean(tf.square(self.z_mu) + tf.exp(self.z_lnsigma)**2 - 2.*self.z_lnsigma - 1.)
 
         self.e_loss      = self.kl_loss     + self.pix_loss
-        self.g_loss      = self.g_loss_fake + self.pix_loss
-        self.d_loss      = self.d_loss_real + self.d_loss_fake
+        self.g_loss      = self.pix_loss    + self.g_loss_fake + self.g_loss_reco
+        self.d_loss      = self.d_loss_real + self.d_loss_fake + self.d_loss_reco
 
         # define optimizer
         #self.e_optimizer = tf.train.AdamOptimizer(self.learnRate,beta1=0.5).minimize(self.e_loss, var_list=[k for k in tf.trainable_variables() if "Encoder"       in k.name])
         self.e_optimizer = tf.train.AdamOptimizer(self.learnRate    ,beta1=0.5).minimize(self.e_loss, var_list=[k for k in tf.trainable_variables() if ("Encoder" in k.name) or ("Generator" in k.name)])
         self.g_optimizer = tf.train.AdamOptimizer(self.learnRate    ,beta1=0.5).minimize(self.g_loss, var_list=[k for k in tf.trainable_variables() if "Generator"     in k.name])
-        self.d_optimizer = tf.train.AdamOptimizer(self.learnRate*0.5,beta1=0.5).minimize(self.d_loss, var_list=[k for k in tf.trainable_variables() if "Discriminator" in k.name])
+        self.d_optimizer = tf.train.AdamOptimizer(self.learnRate*0.3,beta1=0.5).minimize(self.d_loss, var_list=[k for k in tf.trainable_variables() if "Discriminator" in k.name])
 
         ### summary
         tf.summary.scalar("d_loss"      ,self.d_loss)
@@ -347,9 +354,11 @@ class VAEGAN:
         tf.summary.scalar("e_loss"      ,self.e_loss)
         tf.summary.scalar("pix_loss"    ,self.pix_loss)
         tf.summary.scalar("kl_loss"     ,self.kl_loss)
-        tf.summary.scalar("d_loss_fake" ,self.d_loss_fake)
-        tf.summary.scalar("d_loss_real" ,self.d_loss_real)
+        tf.summary.scalar("g_loss_reco" ,self.g_loss_reco)
         tf.summary.scalar("g_loss_fake" ,self.g_loss_fake)
+        tf.summary.scalar("d_loss_real" ,self.d_loss_real)
+        tf.summary.scalar("d_loss_fake" ,self.d_loss_fake)
+        tf.summary.scalar("d_loss_reco" ,self.d_loss_reco)
         tf.summary.histogram("z_mu"     ,self.z_mu   )
         tf.summary.histogram("z_sigma"  ,tf.exp(self.z_lnsigma))
 
@@ -395,28 +404,29 @@ class VAEGAN:
             step += 1
 
             batch_images,_ = f_batch(self.nBatch)
-            _,e_loss,kl_loss,pix_loss        = self.sess.run([self.e_optimizer,self.e_loss,self.kl_loss,self.pix_loss],             feed_dict={self.x:batch_images})
-            _,g_loss,g_loss_fake,z,y_fake    = self.sess.run([self.g_optimizer,self.g_loss,self.g_loss_fake,self.z_mu,self.y_fake], feed_dict={self.x:batch_images})
-            _,d_loss,d_loss_real,d_loss_fake = self.sess.run([self.d_optimizer,self.d_loss,self.d_loss_real,self.d_loss_fake],      feed_dict={self.x:batch_images,self.y_real:batch_images})
+            z_fake = np.random.normal(0.,1.,[self.nBatch,self.zdim])
+            _,e_loss,kl_loss,pix_loss                 = self.sess.run([self.e_optimizer,self.e_loss,self.kl_loss,self.pix_loss],                         feed_dict={self.x:batch_images})
+            _,g_loss,g_loss_reco,z_reco,y_fake,y_reco = self.sess.run([self.g_optimizer,self.g_loss,self.g_loss_reco,self.z_mu,self.y_fake,self.y_reco], feed_dict={self.x:batch_images,self.z_fake:z_fake})
+            _,d_loss,d_loss_real,d_loss_fake          = self.sess.run([self.d_optimizer,self.d_loss,self.d_loss_real,self.d_loss_fake],                  feed_dict={self.x:batch_images,self.y_real:batch_images,self.z_fake:z_fake})
 
             if step>0 and step%10==0:
-                summary = self.sess.run(self.summary,feed_dict={self.x:batch_images,self.y_real:batch_images})
+                summary = self.sess.run(self.summary,feed_dict={self.x:batch_images,self.y_real:batch_images,self.z_fake:z_fake})
                 self.writer.add_summary(summary,step)
 
             if step%500==0:
                 #print "%6d:  time/step = %.2f sec"%(step, time.time()-start)
-                print "%6d: loss(e) = loss(KL)+loss(pix) = %.4e + %.4e = %.4e, loss(g) = loss(fake)+loss(pix) = %.4e + %.4e = %.4e, loss(e) = loss(real)+loss(fake) = %.4e + %.4e = %.4e  time/step = %.2f sec"%(step,kl_loss,pix_loss,e_loss, g_loss_fake,pix_loss,g_loss, d_loss_real,d_loss_fake,d_loss, time.time()-start)
+                print "%6d: loss(e) = loss(KL)+loss(pix) = %.4e + %.4e = %.4e, loss(g) = loss(fake)+loss(pix) = %.4e + %.4e = %.4e, loss(e) = loss(real)+loss(fake) = %.4e + %.4e = %.4e  time/step = %.2f sec"%(step,kl_loss,pix_loss,e_loss, g_loss_reco,pix_loss,g_loss, d_loss_real,d_loss_fake,d_loss, time.time()-start)
                 start = time.time()
 
                 #l0 = np.array([x%10 for x in range(self.nBatch)],dtype=np.int32)
-                z = np.random.normal(0.,1.,[self.nBatch,self.zdim])
                 #z1 = np.zeros([self.nBatch,self.zdim])
+                #z = np.random.normal(0.,1.,[self.nBatch,self.zdim])
 
-                g_image = self.sess.run(self.y_sample,feed_dict={self.z_sample:z})
+                #g_image = self.sess.run(self.y_sample,feed_dict={self.z_sample:z})
                 #g_image2 = self.sess.run(self.y_sample,feed_dict={self.z:z2,self.l:l0})
                 cv2.imwrite(os.path.join(self.saveFolder,"images","img_%d_real.png"%step),tileImage(batch_images)*255.)
-                cv2.imwrite(os.path.join(self.saveFolder,"images","img_%d_reco.png"%step),tileImage(y_fake)*255.)
-                cv2.imwrite(os.path.join(self.saveFolder,"images","img_%d_rand.png"%step),tileImage(g_image)*255.)
+                cv2.imwrite(os.path.join(self.saveFolder,"images","img_%d_reco.png"%step),tileImage(y_reco)*255.)
+                cv2.imwrite(os.path.join(self.saveFolder,"images","img_%d_rand.png"%step),tileImage(y_fake)*255.)
                 #cv2.imwrite(os.path.join(self.saveFolder,"images","img_%d_fake2.png"%step),tileImage(g_image2)*255.)
                 self.saver.save(self.sess,os.path.join(self.saveFolder,"model.ckpt"),step)
 
